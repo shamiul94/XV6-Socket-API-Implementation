@@ -1,0 +1,771 @@
+commit eca56c6e803edc253696b991691eaae1f866e8ce
+Author: shamiul94 <1505038.sh@ugrad.cse.buet.ac.bd>
+Date:   Sun Jan 20 00:12:23 2019 +0600
+
+    commit-2
+
+diff --git a/Makefile b/Makefile
+index 09d790c..e011a93 100644
+--- a/Makefile
++++ b/Makefile
+@@ -16,12 +16,14 @@ OBJS = \
+ 	pipe.o\
+ 	proc.o\
+ 	sleeplock.o\
++	sock.o\
+ 	spinlock.o\
+ 	string.o\
+ 	swtch.o\
+ 	syscall.o\
+ 	sysfile.o\
+ 	sysproc.o\
++	syssock.o\
+ 	trapasm.o\
+ 	trap.o\
+ 	uart.o\
+@@ -181,6 +183,7 @@ UPROGS=\
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++	_socktest\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+diff --git a/cat.c b/cat.c
+index 5ddc820..7a5761e 100644
+--- a/cat.c
++++ b/cat.c
+@@ -4,6 +4,7 @@
+ 
+ char buf[512];
+ 
++
+ void
+ cat(int fd)
+ {
+@@ -21,6 +22,7 @@ cat(int fd)
+   }
+ }
+ 
++
+ int
+ main(int argc, char *argv[])
+ {
+diff --git a/defs.h b/defs.h
+index 82fb982..ae6ae7e 100644
+--- a/defs.h
++++ b/defs.h
+@@ -121,6 +121,14 @@ int             wait(void);
+ void            wakeup(void*);
+ void            yield(void);
+ 
++// sock.c
++void            sinit(void);
++int             listen(int);
++int             connect(int, const char*);
++int             send(int, const char*, int);
++int             recv(int, char*, int);
++int             disconnect(int);
++
+ // swtch.S
+ void            swtch(struct context**, struct context*);
+ 
+diff --git a/main.c b/main.c
+index 9924e64..ac0b23e 100644
+--- a/main.c
++++ b/main.c
+@@ -4,6 +4,7 @@
+ #include "memlayout.h"
+ #include "mmu.h"
+ #include "proc.h"
++#include "sock.h"
+ #include "x86.h"
+ 
+ static void startothers(void);
+@@ -27,10 +28,11 @@ main(void)
+   consoleinit();   // console hardware
+   uartinit();      // serial port
+   pinit();         // process table
++  sinit();         // socket table
+   tvinit();        // trap vectors
+   binit();         // buffer cache
+   fileinit();      // file table
+-  ideinit();       // disk 
++  ideinit();       // disk
+   startothers();   // start other processors
+   kinit2(P2V(4*1024*1024), P2V(PHYSTOP)); // must come after startothers()
+   userinit();      // first user process
+diff --git a/param.h b/param.h
+index a7e90ef..d88834c 100644
+--- a/param.h
++++ b/param.h
+@@ -1,3 +1,6 @@
++#define NPORT       128  // maximum number of ports
++#define NSOCK        32  // maximum number of sockets
++#define MAX_BUFFER_SIZE 128
+ #define NPROC        64  // maximum number of processes
+ #define KSTACKSIZE 4096  // size of per-process kernel stack
+ #define NCPU          8  // maximum number of CPUs
+@@ -12,3 +15,9 @@
+ #define NBUF         (MAXOPBLOCKS*3)  // size of disk block cache
+ #define FSSIZE       1000  // size of file system in blocks
+ 
++#define 	E_NOTFOUND 			-1025
++#define 	E_ACCESS_DENIED 	-1026
++#define 	E_WRONG_STATE 		-1027
++#define 	E_FAIL 				-1028
++#define 	E_INVALID_ARG 		-1029
++
+diff --git a/sc.sh b/sc.sh
+new file mode 100755
+index 0000000..ea738cc
+--- /dev/null
++++ b/sc.sh
+@@ -0,0 +1,3 @@
++make clean
++make
++make qemu
+\ No newline at end of file
+diff --git a/sock.c b/sock.c
+new file mode 100644
+index 0000000..fce8ef3
+--- /dev/null
++++ b/sock.c
+@@ -0,0 +1,353 @@
++#include "types.h"
++#include "defs.h"
++#include "param.h"
++#include "spinlock.h"
++#include "sock.h"
++#include "memlayout.h"
++#include "mmu.h"
++#include "x86.h"
++#include "proc.h"
++
++int currPort = 0;
++
++struct {
++    struct spinlock lock;
++    Socket sock[NSOCK];
++} stable;
++
++int retExit(int code) {
++    release(&stable.lock); // not sure
++    return code;
++}
++
++void
++sinit(void) {
++    initlock(&stable.lock, "stable");
++    Socket *ps;
++
++    for (ps = stable.sock; ps < &stable.sock[NSOCK]; ps++) {
++        ps->state = CLOSED;
++    }
++}
++
++int isAlreadyOpenOnThisPort(int lport) {
++    Socket *ps;
++    int alreadyOpened = 0;
++
++    for (ps = stable.sock; ps < &stable.sock[NSOCK]; ps++) {
++        if (ps->state != CLOSED && ps->localPort == lport) {
++            alreadyOpened = 1;
++            break;
++        }
++    }
++    return alreadyOpened;
++}
++
++
++int
++listen(int lport) {
++
++    if (lport < 0 || lport >= NPORT) {
++        cprintf("Invalid Parameter Error: E_INVALID_ARG\n");
++        return retExit(E_INVALID_ARG);
++    }
++
++    acquire(&stable.lock); // not sure
++
++    int ret = -1;
++
++    // if another socket is already opened on this port
++    if (isAlreadyOpenOnThisPort(lport)) {
++        goto EXIT;
++    }
++
++    Socket *ps, *pLocalSocket; // p = pointer
++
++    int freePortFound = 0;
++    for (ps = stable.sock; ps < &stable.sock[NSOCK]; ps++) {
++        if (ps->state == CLOSED) {
++            freePortFound = 1;
++            pLocalSocket = ps;
++            break;
++        }
++    }
++
++    // if every socket is taken by other ports and can't be assigned to this port.
++    if (!freePortFound) {
++        cprintf("No more socket can be opened (Limit exceeded) Error.\n");
++        return retExit(E_FAIL);
++    }
++
++
++    pLocalSocket->state = LISTENING;
++    pLocalSocket->localPort = lport;
++    pLocalSocket->remotePort = -1; // dummy value
++    pLocalSocket->ownerProcessID = myproc()->pid;
++    pLocalSocket->hasData = 0;
++
++    sleep(pLocalSocket, &stable.lock);
++
++
++    if (pLocalSocket->state == CONNECTED) {
++        ret = 0;
++    } else {
++        ret = -1;
++    }
++
++    EXIT:
++    release(&stable.lock); // not sure
++    return ret;
++}
++
++
++int
++connect(int rport, const char *host) {
++
++    if (rport < 0 || rport >= NPORT) {
++        cprintf("Invalid Parameter Error: E_INVALID_ARG\n");
++        return retExit(E_INVALID_ARG);
++    }
++
++    if (!(strncmp(host, "localhost", strlen(host)) == 0 || strncmp(host, "127.0.0.1", strlen(host)) == 0)) {
++        cprintf("Invalid Parameter Error: E_INVALID_ARG\n");
++        return retExit(E_INVALID_ARG);
++    }
++
++    int ret = -1;
++
++    acquire(&stable.lock);
++
++    Socket *ps, *pRemoteSocket = 0, *pLocalSocket;
++
++
++/**************** Confirm Remote Socket (Server) ***************/
++
++    int remotePortFound = 0;
++
++    for (ps = stable.sock; ps < &stable.sock[NSOCK]; ps++) {
++        if (ps->state == LISTENING && ps->localPort == rport) {
++            remotePortFound = 1;
++            pRemoteSocket = ps;
++            break;
++        }
++    }
++
++
++    if (!remotePortFound) {
++        cprintf("Socket not found at Port Error.\n");
++        return retExit(E_NOTFOUND);
++    }
++
++
++/***********Confirm availability of Local Socket (Client) *************/
++
++    int lport = (currPort + 1) % NPORT;
++    currPort++;
++
++    while (isAlreadyOpenOnThisPort(lport)) {
++        lport = (currPort + 1) % NPORT;
++        currPort++;
++    }
++
++    int freePortFound = 0;
++    for (ps = stable.sock; ps < &stable.sock[NSOCK]; ps++) {
++        if (ps->state == CLOSED) {
++            freePortFound = 1;
++            pLocalSocket = ps;
++            break;
++        }
++    }
++
++    if (!freePortFound) {
++        cprintf("No more socket can be opened (Limit exceeded) Error.\n");
++        return retExit(E_FAIL);
++    }
++
++
++    pLocalSocket->state = CONNECTED;
++    pRemoteSocket->state = CONNECTED; // attribute of remote socket
++
++    pLocalSocket->localPort = lport;
++    pLocalSocket->remotePort = rport;
++
++    pRemoteSocket->remotePort = lport; // attribute of remote socket
++
++    pLocalSocket->ownerProcessID = myproc()->pid;
++    pLocalSocket->hasData = 0;
++    pRemoteSocket->hasData = 0;
++
++    wakeup(pRemoteSocket); // have to check
++
++    ret = lport;
++    cprintf("##########################################################################\n");
++    cprintf("#  Client opened at Port: %d and it's connected with Server at Port: %d  #\n", pLocalSocket->localPort,
++            pRemoteSocket->localPort);
++    cprintf("##########################################################################\n");
++
++
++//    EXIT:
++    release(&stable.lock);
++    return ret;
++}
++
++Socket *getSocketByPort(int lport) {
++    Socket *ps, *sock = 0;
++
++    for (ps = stable.sock; ps < &stable.sock[NSOCK]; ps++) {
++        if (ps->localPort == lport) {
++            sock = ps;
++            break;
++        }
++    }
++    return sock;
++}
++
++int
++send(int lport, const char *data, int n) {
++
++    if (lport < 0 || lport >= NPORT) {
++        cprintf("Invalid Parameter Error: E_INVALID_ARG\n");
++        return retExit(E_INVALID_ARG);
++    }
++
++    if (n <= 0 || n > MAX_BUFFER_SIZE) {
++        cprintf("Invalid Parameter Error: E_INVALID_ARG\n");
++        return retExit(E_INVALID_ARG);
++    }
++
++    int ret = -1;
++    acquire(&stable.lock);
++    Socket *pRemoteSocket, *pLocalSocket;
++
++    pLocalSocket = getSocketByPort(lport);
++
++    if (!pLocalSocket) {
++        cprintf("Socket not found at Port Error.\n");
++        return retExit(E_NOTFOUND);
++    }
++
++    if (pLocalSocket->ownerProcessID != myproc()->pid) {
++        cprintf("Access denied from foreign process Error: PID = %d\n", myproc()->pid);
++        return retExit(E_ACCESS_DENIED);
++
++    }
++    // accessed by another process.
++
++    pRemoteSocket = getSocketByPort(pLocalSocket->remotePort);
++
++    if (!pRemoteSocket) {
++        cprintf("Socket not found at Port Error.\n");
++        return retExit(E_NOTFOUND);
++    }
++
++
++    if (pRemoteSocket->state != CONNECTED || pLocalSocket->state != CONNECTED) {
++        cprintf("Local socket port: %d and Remote socket Port: %d aren't connected Error.\n", pLocalSocket->localPort,
++                pRemoteSocket->localPort);
++        return retExit(E_WRONG_STATE);
++    }
++
++
++    while (pRemoteSocket->hasData) {
++        sleep(pRemoteSocket, &stable.lock);
++    }
++
++    strncpy(pRemoteSocket->buffer, data, n);
++    pRemoteSocket->hasData = 1;
++    ret = 0;
++
++    wakeup(pLocalSocket); // check later***
++
++//    EXIT:
++    release(&stable.lock);
++    return ret;
++}
++
++
++int
++recv(int lport, char *data, int n) {
++
++    if (lport < 0 || lport >= NPORT) {
++        cprintf("Invalid Parameter Error: E_INVALID_ARG\n");
++        return retExit(E_INVALID_ARG);
++    }
++    if (n <= 0 || n > MAX_BUFFER_SIZE) {
++        cprintf("Invalid Parameter Error: E_INVALID_ARG\n");
++        return retExit(E_INVALID_ARG);
++    }
++
++    int ret = -1;
++    acquire(&stable.lock);
++
++    Socket *pRemoteSocket, *pLocalSocket;
++
++    pLocalSocket = getSocketByPort(lport);
++
++    if (!pLocalSocket) {
++        cprintf("Socket not found at Port Error.\n");
++        return retExit(E_NOTFOUND);
++    } // no socket on this port
++
++
++    if (pLocalSocket->ownerProcessID != myproc()->pid) {
++        cprintf("Access denied from foreign process Error: PID = %d\n", myproc()->pid);
++        return retExit(E_ACCESS_DENIED);
++    }
++
++    pRemoteSocket = getSocketByPort(pLocalSocket->remotePort);
++
++    if (!pRemoteSocket) {
++        cprintf("Socket not found at Port Error.\n");
++        return retExit(E_NOTFOUND);
++    }
++
++    if (pRemoteSocket->state != CONNECTED || pLocalSocket->state != CONNECTED) {
++        cprintf("Local socket port: %d and Remote socket Port: %d aren't connected Error.\n", pLocalSocket->localPort,
++                pRemoteSocket->localPort);
++        return retExit(E_WRONG_STATE);
++    }
++
++    while (!pLocalSocket->hasData) {
++        sleep(pRemoteSocket, &stable.lock);
++    }
++
++    strncpy(data, pLocalSocket->buffer, n);
++
++    pLocalSocket->hasData = 0;
++
++    wakeup(pLocalSocket); // check later***
++
++    ret = 0;
++
++//    EXIT:
++    release(&stable.lock);
++    return ret;
++}
++
++int
++disconnect(int lport) {
++    if (lport < 0 || lport >= NPORT) {
++        cprintf("Invalid Parameter Error: E_INVALID_ARG\n");
++        return retExit(E_INVALID_ARG);
++    }
++
++    acquire(&stable.lock);
++
++    Socket *pLocalSocket;
++
++    pLocalSocket = getSocketByPort(lport);
++
++    if (!pLocalSocket) {
++        cprintf("Socket not found at Port Error.\n");
++        return retExit(E_NOTFOUND);
++    }
++
++    pLocalSocket->state = CLOSED;
++    pLocalSocket->localPort = -1;
++    pLocalSocket->remotePort = -1;
++    pLocalSocket->hasData = 0;
++
++    release(&stable.lock);
++
++    return 0;
++}
+diff --git a/sock.h b/sock.h
+new file mode 100644
+index 0000000..1682a2d
+--- /dev/null
++++ b/sock.h
+@@ -0,0 +1,16 @@
++
++enum State {
++    CLOSED, LISTENING, CONNECTED
++};
++
++
++struct socket {
++    enum State state;
++    int localPort;
++    int remotePort;
++    int ownerProcessID;
++    char buffer[128];
++    int hasData;
++};
++
++typedef struct socket Socket;
+\ No newline at end of file
+diff --git a/socktest.c b/socktest.c
+new file mode 100644
+index 0000000..e25ebb1
+--- /dev/null
++++ b/socktest.c
+@@ -0,0 +1,78 @@
++#include "types.h"
++#include "user.h"
++
++int serverPort = 10;
++
++void clientProc() {
++  int clientPort;
++  char buf[128];
++  char host[16] = "localhost";
++
++  // sleep for 100 clock ticks to ensure that the server process starts first.
++  sleep(100);
++
++  printf(1, "Client>> Attempting to connect to port %d, host %s ...\n", serverPort, host);
++  clientPort = connect(serverPort, host);
++  sleep(20);
++  printf(1, "Client>> connect() returned %d\n", clientPort);
++
++  while (1) {
++    printf(1, "Client>> Enter text to send to server: ");
++    gets(buf, sizeof(buf));
++    buf[strlen(buf) - 1] = '\0'; // Eliminating the '\n'
++    send(clientPort, buf, strlen(buf) + 1);
++
++    if (0 == strcmp(buf, "exit")) {
++      printf(1, "Client exiting...\n");
++      disconnect(clientPort);
++      break;
++    }
++
++    sleep(100 + uptime() % 100);
++
++    recv(clientPort, buf, sizeof(buf));
++    printf(1, "Client>> Received: \"%s\"\n", buf);
++  }
++}
++
++void serverProc() {
++  int status;
++  char buf[128];
++
++
++  printf(1, "Server>> Starting to listen at port %d ...\n", serverPort);
++  status = listen(serverPort);
++  printf(1, "Server>> listen() returned %d\n", status);
++
++  while (1) {
++    sleep(100 + uptime() % 100);
++
++    recv(serverPort, buf, sizeof(buf));
++    printf(1, "Server>> Received: \"%s\"\n", buf);
++
++    if (0 == strcmp(buf, "exit")) {
++      printf(1, "Server exiting...\n");
++      disconnect(serverPort);
++      break;
++    }
++
++    sleep(100 + uptime() % 100);
++
++    strcpy(buf+strlen(buf), " OK");
++    send(serverPort, buf, strlen(buf) + 1);
++  }
++}
++
++
++int main(int argc, char *argv[])
++{
++  if (0 == fork()) {
++    clientProc();
++    exit();
++  } else {
++    serverProc();
++    // This is the parent process. So, it needs to wait before client terminates
++    wait();
++    exit();
++  }
++}
+diff --git a/syscall.c b/syscall.c
+index ee85261..c06bb58 100644
+--- a/syscall.c
++++ b/syscall.c
+@@ -60,7 +60,7 @@ argptr(int n, char **pp, int size)
+ {
+   int i;
+   struct proc *curproc = myproc();
+- 
++
+   if(argint(n, &i) < 0)
+     return -1;
+   if(size < 0 || (uint)i >= curproc->sz || (uint)i+size > curproc->sz)
+@@ -103,6 +103,11 @@ extern int sys_unlink(void);
+ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
++extern int sys_listen(void);
++extern int sys_connect(void);
++extern int sys_send(void);
++extern int sys_recv(void);
++extern int sys_disconnect(void);
+ 
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -126,6 +131,11 @@ static int (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_listen]  sys_listen,
++[SYS_connect] sys_connect,
++[SYS_send]    sys_send,
++[SYS_recv]    sys_recv,
++[SYS_disconnect] sys_disconnect
+ };
+ 
+ void
+diff --git a/syscall.h b/syscall.h
+index bc5f356..289fb4b 100644
+--- a/syscall.h
++++ b/syscall.h
+@@ -20,3 +20,8 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_listen  22
++#define SYS_connect  23
++#define SYS_send  24
++#define SYS_recv  25
++#define SYS_disconnect  26
+diff --git a/syssock.c b/syssock.c
+new file mode 100644
+index 0000000..9f2dc68
+--- /dev/null
++++ b/syssock.c
+@@ -0,0 +1,91 @@
++#include "types.h"
++#include "defs.h"
++#include "param.h"
++#include "memlayout.h"
++#include "mmu.h"
++#include "x86.h"
++#include "proc.h"
++
++int
++sys_listen(void) {
++    int port = 0;
++
++    if (argint(0, &port) < 0) {
++        return -1;
++    }
++    return listen(port);
++}
++
++int
++sys_connect(void) {
++    int port = 0;
++    char *host = 0;
++
++    // connect(int rport, const char* host)
++
++    if (argint(0, &port) < 0) {
++        return -1;
++    }
++    if (argstr(1, &host) < 0) {
++        return -1;
++    }
++
++    return connect(port, host);
++}
++
++int
++sys_send(void) {
++    int port = 0;
++    char *buf = 0;
++    int n = 0;
++
++    // send(int lport, const char* data, int n)
++
++    if (argint(0, &port) < 0) {
++        return -1;
++    }
++    if (argstr(1, &buf) < 0) {
++        return -1;
++    }
++    if (argint(2, &n) < 0) {
++        return -1;
++    }
++
++
++    return send(port, buf, n);
++}
++
++int
++sys_recv(void) {
++    int port = 0;
++    char *buf = 0;
++    int n = 0;
++
++    // recv(int lport, char* data, int n)
++
++    if (argint(0, &port) < 0) {
++        return -1;
++    }
++
++    if (argstr(1, &buf) < 0) {
++        return -1;
++    }
++
++    if (argint(2, &n) < 0) {
++        return -1;
++    }
++
++    return recv(port, buf, n);
++}
++
++int
++sys_disconnect(void) {
++    int port = 0;
++
++    // disconnect(int lport)
++    if (argint(0, &port) < 0) {
++        return -1;
++    }
++
++    return disconnect(port);
++}
+diff --git a/user.h b/user.h
+index 4f99c52..ce9f2f1 100644
+--- a/user.h
++++ b/user.h
+@@ -23,6 +23,11 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int listen(int);
++int connect(int, const char* host);
++int send(int, const char*, int);
++int recv(int, char*, int);
++int disconnect(int);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/usys.S b/usys.S
+index 8bfd8a1..2ac5ed0 100644
+--- a/usys.S
++++ b/usys.S
+@@ -29,3 +29,9 @@ SYSCALL(getpid)
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(listen)
++SYSCALL(connect)
++SYSCALL(send)
++SYSCALL(recv)
++SYSCALL(disconnect)
++
